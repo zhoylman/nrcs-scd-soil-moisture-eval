@@ -1,26 +1,69 @@
+# =============================================================
+# Title: Stability-Selected LASSO for Soil Moisture Model Comparison
+# Author: Zachary H. Hoylman
+# Date: 8/10/2025
+#
+# Description:
+# This script implements LASSO regression with stability selection 
+# using the `stabs` R package to identify robust predictors of 
+# Topofire and SOILWAT2 model performance across soil moisture sites.
+#
+# Why stability-selected LASSO?
+# - Traditional AIC-based model selection (e.g., stepwise regression)
+#   does not handle collinearity well and lacks regularization.
+# - Standard LASSO (via `glmnet`) improves on this by shrinking 
+#   coefficients and selecting features, but its selection is 
+#   unstable under collinearity — small changes in data can lead 
+#   to different predictors being chosen.
+# - Stability selection wraps LASSO with a resampling-based procedure 
+#   that identifies predictors consistently selected across many 
+#   subsamples of the data, offering greater interpretability and 
+#   control over false positive rates.
+#
+# This approach is especially important here due to the high likelihood 
+# of collinearity among climate and soil covariates, and the need for 
+# scientifically interpretable predictor sets in manuscript figures 
+# and tables.
+# =============================================================
+
 # ========== Load Libraries ==========
 library(tidyverse)
 library(glmnet)
 library(gridExtra)
 library(grid)
 library(ragg)
+library(stabs)
 
 # ========== Load Data ==========
-station_covariates = read_csv("~/nrcs-scd-soil-moisture-eval-data/processed/station-covariates.csv") %>%
-  dplyr::select(network, site_id, ppt, soltotal, tdmean, tmean, vpdmax, sand,silt,clay, depth_to_restrictive, topofire_aws, topofire_porosity)
+station_covariates = read_csv("~/nrcs-scd-soil-moisture-eval-data/processed/station-covariates.csv") #%>%
+  #dplyr::select(network, site_id, ppt, soltotal, tdmean, tmean, vpdmax, sand, silt, clay, depth_to_restrictive, topofire_aws, porosity_gNATSGO)
 
 station_meta = read_csv("~/nrcs-scd-soil-moisture-eval-data/processed/station-meta-conus-w-data-final.csv")
 
-topofire_corelations = read_csv("~/nrcs-scd-soil-moisture-eval-data/processed/topofire-corelations-generalized-depth.csv") %>%
-  mutate(model = "Topofire") %>%
+sport_corelations = read_csv("~/nrcs-scd-soil-moisture-eval-data/processed/SPoRT-LIS-corelations-generalized-depth.csv") %>%
+  mutate(model = "SPoRT-LIS") |>
+  #average results across horizontal positions in neon
+  group_by(network, site_id,  generalized_depth, model) |>
+  summarise(`Pearson's r` = median(`Pearson's r`, na.rm = T),
+            Bias = median(Bias, na.rm = T),
+            RMSE = median(RMSE, na.rm = T),
+            KGE = median(KGE, na.rm = T)) |>
+  ungroup() |>
   rename(r = `Pearson's r`)
 
 soilwat2_corelations = read_csv("~/nrcs-scd-soil-moisture-eval-data/processed/soilwat2-corelations-generalized-depth.csv") %>%
-  mutate(model = "SOILWAT2") %>%
+  mutate(model = "SOILWAT2")|>
+  #average results across horizontal positions in neon
+  group_by(network, site_id,  generalized_depth, model) |>
+  summarise(`Pearson's r` = median(`Pearson's r`, na.rm = T),
+            Bias = median(Bias, na.rm = T),
+            RMSE = median(RMSE, na.rm = T),
+            KGE = median(KGE, na.rm = T)) |>
+  ungroup() |>
   rename(r = `Pearson's r`)
 
 # Combine
-all_corelations = bind_rows(topofire_corelations, soilwat2_corelations) %>%
+all_corelations = bind_rows(sport_corelations, soilwat2_corelations) %>%
   filter(generalized_depth == 'Depth Averaged')
 
 #diffrerence data
@@ -29,17 +72,16 @@ all_corelations_difference = all_corelations %>%
   filter(generalized_depth == "Depth Averaged") %>%  # optional if you want just one depth
   pivot_wider(
     names_from = model,
-    values_from = c(r, Bias, RMSE, NSE, KGE),
+    values_from = c(r, Bias, RMSE, KGE),
     names_sep = "_"
   ) %>%
   mutate(
-    r_diff    = r_Topofire - r_SOILWAT2,
-    bias_diff = Bias_Topofire - Bias_SOILWAT2,
-    rmse_diff = RMSE_Topofire - RMSE_SOILWAT2,
-    nse_diff  = NSE_Topofire - NSE_SOILWAT2,
-    kge_diff  = KGE_Topofire - KGE_SOILWAT2
+    r_diff    = `r_SPoRT-LIS` - r_SOILWAT2,
+    bias_diff = `Bias_SPoRT-LIS` - Bias_SOILWAT2,
+    rmse_diff = `RMSE_SPoRT-LIS` - RMSE_SOILWAT2,
+    kge_diff  = `KGE_SPoRT-LIS` - KGE_SOILWAT2
   ) %>%
-  dplyr::select(network,site_id,generalized_depth, r_diff, bias_diff, rmse_diff, nse_diff, kge_diff)
+  dplyr::select(network,site_id,generalized_depth, r_diff, bias_diff, rmse_diff, kge_diff)
 
 # ========== Prepare Full Merged Dataset ==========
 merged_all_models = all_corelations %>%
@@ -75,6 +117,30 @@ fit_lasso_and_refit_ols = function(df, response) {
   lm(as.formula(paste(response, "~", paste(final_feats, collapse = "+"))), data = df)
 }
 
+fit_stability_selected_ols = function(df, response, cutoff = 0.75, PFER = 1) {
+  df = df %>% select(all_of(c(response, predictors))) %>% drop_na()
+  if (nrow(df) == 0) return(NULL)
+  
+  X = model.matrix(as.formula(paste(response, "~", paste(predictors, collapse = "+"))), data = df)[, -1]
+  y = df[[response]]
+  
+  stabsel_fit = stabsel(
+    x = X,
+    y = y,
+    fitfun = glmnet.lasso,
+    cutoff = cutoff,
+    PFER = PFER
+  )
+  
+  selected_vars = colnames(X)[stabsel_fit$selected]
+  
+  if (length(selected_vars) == 0) {
+    return(lm(as.formula(paste(response, "~ 1")), data = df))
+  } else {
+    return(lm(as.formula(paste(response, "~", paste(selected_vars, collapse = "+"))), data = df))
+  }
+}
+
 # ========== Variable Name Map ==========
 variable_name_map = c(
   ppt = "Precipitation (mm/month)",
@@ -96,8 +162,8 @@ variable_name_map = c(
   bulk_density = "Bulk Density (g/cm³)",
   awc = "Available Water Holding Capacity (cm)",
   depth_to_restrictive = "Depth to Restrictive Layer (cm)",
-  topofire_aws = "SSURGO AWS (mm)",
-  topofire_porosity = "SSURGO Porosity (mm/m)"
+  topofire_aws = "gNATSGO AWS (mm)",
+  porosity_gNATSGO = "gNATSGO Porosity (mm/m)"
 )
 
 # ========== Table Export Function ==========
@@ -113,7 +179,7 @@ format_regression_table_png <- function(model_summary, soil_depth, response_vari
     TRUE ~ response_variable
   )
   
-  title_line1 <- "LASSO Regression Results"
+  title_line1 <- "Stability-Selected LASSO Regression Results"
   title_line2 <- paste(prefix, soil_depth, response_label, sep = " ")
   
   # Extract and format coefficients
@@ -133,7 +199,7 @@ format_regression_table_png <- function(model_summary, soil_depth, response_vari
   # Adjust height dynamically
   n_rows <- nrow(reg_table)
   row_height <- 35
-  base_height <- 350  # Increased to allow for 2-line title
+  base_height <- 200  # Increased to allow for 2-line title
   img_height <- base_height + (n_rows * row_height)
   
   # Table grob
@@ -144,15 +210,20 @@ format_regression_table_png <- function(model_summary, soil_depth, response_vari
   )
   
   # Plot
-  ragg::agg_png(export_path, width = 1200, height = img_height, res = 150)
+  ragg::agg_png(export_path, width = 1000, height = img_height, res = 150)
   grid.newpage()
-  layout <- grid.layout(nrow = 3, heights = unit(c(3.5, 1, 1.5), c("lines", "null", "lines")))
+  
+  # Use a more compact layout
+  layout <- grid.layout(
+    nrow = 3,
+    heights = unit(c(2.5, 1, 1), c("lines", "null", "lines"))  # reduce top and bottom padding
+  )
   pushViewport(viewport(layout = layout))
   
-  # Two-line title
+  # Title lines
   pushViewport(viewport(layout.pos.row = 1))
-  grid.text(title_line1, y = unit(0.75, "npc"), gp = gpar(fontsize = 14, fontface = "bold"))
-  grid.text(title_line2, y = unit(0.35, "npc"), gp = gpar(fontsize = 13))
+  grid.text(title_line1, y = unit(0.7, "npc"), gp = gpar(fontsize = 14, fontface = "bold"))
+  grid.text(title_line2, y = unit(0.3, "npc"), gp = gpar(fontsize = 12))
   popViewport()
   
   # Table
@@ -160,9 +231,13 @@ format_regression_table_png <- function(model_summary, soil_depth, response_vari
   grid.draw(gt_grob)
   popViewport()
   
-  # R2 footer
+  # Footer (R²)
   pushViewport(viewport(layout.pos.row = 3))
-  grid.text(paste("R² =", r2, "| Adjusted R² =", adj_r2), gp = gpar(fontsize = 12, fontface = "italic"))
+  grid.text(
+    paste("R² =", r2, "| Adjusted R² =", adj_r2),
+    y = unit(0.5, "npc"),
+    gp = gpar(fontsize = 11, fontface = "italic")
+  )
   popViewport()
   
   dev.off()
@@ -172,7 +247,10 @@ format_regression_table_png <- function(model_summary, soil_depth, response_vari
 # ========== MODEL FITTING AND EXPORT LOOP ==========
 fit_and_export_models = function(data, response_vars, prefix) {
   map(response_vars, function(resp) {
-    model = fit_lasso_and_refit_ols(data, resp)
+    #old method, original LASSO
+    #model = fit_lasso_and_refit_ols(data, resp)
+    #new method with stabs (stability selection)
+    model = fit_stability_selected_ols(data, resp)
     if (!is.null(model)) {
       summary_obj = summary(model)
       out_path = glue::glue("~/nrcs-scd-soil-moisture-eval/tables/lasso-{prefix}-{tolower(resp)}.png")
@@ -181,13 +259,10 @@ fit_and_export_models = function(data, response_vars, prefix) {
   })
 }
 
-fit_and_export_models(merged_all_models %>% filter(model == 'Topofire'), c("r", "KGE"), "Topofire")
+fit_and_export_models(merged_all_models %>% filter(model == 'SPoRT-LIS'), c("r", "KGE"), 'SPoRT-LIS')
 fit_and_export_models(merged_all_models %>% filter(model == 'SOILWAT2'), c("r", "KGE"), "SOILWAT2")
 
 # quartile box plots
-library(tidyverse)
-library(ggplot2)
-
 plot_box_by_quartile <- function(data, predictor, target, n_bins = 4, 
                                  predictor_label = NULL, target_label = NULL, 
                                  title = NULL, fill_color = "#2c7fb8",
@@ -233,7 +308,7 @@ plot_box_by_quartile <- function(data, predictor, target, n_bins = 4,
   p <- ggplot(plot_data, aes(x = factor(bin_label, levels = bin_means$bin_label), y = !!target_sym)) +
     geom_boxplot(fill = fill_color, color = "black", outlier.shape = NA) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
-    annotate("text", x = 0.5, y = 0 + zero_offset, label = "Topofire is better →", angle = 90, hjust = 0, size = 4.5) +
+    annotate("text", x = 0.5, y = 0 + zero_offset, label = "SPoRT-LIS is better →", angle = 90, hjust = 0, size = 4.5) +
     annotate("text", x = 0.5, y = 0 - zero_offset, label = "← SOILWAT2 is better", angle = 90, hjust = 1, size = 4.5) +
     scale_y_continuous(limits = y_lim) +
     labs(
@@ -262,7 +337,7 @@ plot_box_by_quartile(
   target = kge_diff,
   n_bins = 4,
   predictor_label = "Precipitation (mm/month)",
-  target_label = "ΔKGE (Topofire - SOILWAT2)",
+  target_label = "ΔKGE (SPoRT-LIS - SOILWAT2)",
   fill_color = "blue",
   export_path = "~/nrcs-scd-soil-moisture-eval/figs/kge_diff_by_ppt.png"
 )
@@ -273,7 +348,7 @@ plot_box_by_quartile(
   target = kge_diff,
   n_bins = 4,
   predictor_label = "Mean Temperature (°C)",
-  target_label = "ΔKGE (Topofire - SOILWAT2)",
+  target_label = "ΔKGE (SPoRT-LIS - SOILWAT2)",
   fill_color = "red",
   export_path = "~/nrcs-scd-soil-moisture-eval/figs/kge_diff_by_tmean.png"
 )
@@ -284,7 +359,7 @@ plot_box_by_quartile(
   target = r_diff,
   n_bins = 4,
   predictor_label = "Precipitation (mm/month)",
-  target_label = "ΔPearson's R (Topofire - SOILWAT2)",
+  target_label = "ΔPearson's R (SPoRT-LIS - SOILWAT2)",
   fill_color = "blue",
   export_path = "~/nrcs-scd-soil-moisture-eval/figs/r_diff_by_ppt.png"
 )
@@ -295,7 +370,7 @@ plot_box_by_quartile(
   target = r_diff,
   n_bins = 4,
   predictor_label = "Mean Temperature (°C)",
-  target_label = "ΔPearson's R (Topofire - SOILWAT2)",
+  target_label = "ΔPearson's R (SPoRT-LIS - SOILWAT2)",
   fill_color = "red",
   export_path = "~/nrcs-scd-soil-moisture-eval/figs/r_diff_by_tmean.png"
 )
@@ -306,7 +381,7 @@ plot_box_by_quartile(
   target = kge_diff,
   n_bins = 4,
   predictor_label = "SSURGO AWS (mm)",
-  target_label = "ΔKGE (Topofire - SOILWAT2)",
+  target_label = "ΔKGE (SPoRT-LIS - SOILWAT2)",
   fill_color = "darkgrey",
   export_path = "~/nrcs-scd-soil-moisture-eval/figs/kge_diff_by_ssurgo_aws.png"
 )
@@ -317,7 +392,7 @@ plot_box_by_quartile(
   target = r_diff,
   n_bins = 4,
   predictor_label = "SSURGO AWS (mm)",
-  target_label = "ΔPearson's R (Topofire - SOILWAT2)",
+  target_label = "ΔPearson's R (SPoRT-LIS - SOILWAT2)",
   fill_color = "darkgrey",
   export_path = "~/nrcs-scd-soil-moisture-eval/figs/r_diff_by_ssurgo_aws.png"
 )
@@ -328,7 +403,7 @@ plot_box_by_quartile(
   target = kge_diff,
   n_bins = 4,
   predictor_label = "Sand (%)",
-  target_label = "ΔKGE (Topofire - SOILWAT2)",
+  target_label = "ΔKGE (SPoRT-LIS - SOILWAT2)",
   fill_color = "#836539",
   export_path = "~/nrcs-scd-soil-moisture-eval/figs/kge_diff_by_ssurgo_sand.png"
 )
@@ -339,7 +414,7 @@ plot_box_by_quartile(
   target = r_diff,
   n_bins = 4,
   predictor_label = "Sand (%)",
-  target_label = "ΔPearson's R (Topofire - SOILWAT2)",
+  target_label = "ΔPearson's R (SPoRT-LIS - SOILWAT2)",
   fill_color = "#836539",
   export_path = "~/nrcs-scd-soil-moisture-eval/figs/r_diff_by_ssurgo_sand.png"
 )

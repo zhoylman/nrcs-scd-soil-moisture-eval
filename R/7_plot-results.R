@@ -1,13 +1,27 @@
 library(tidyverse)
 library(sf)
 
-topofire = read_csv("~/nrcs-scd-soil-moisture-eval-data/processed/topofire-corelations-generalized-depth.csv") %>%
-  mutate(model = 'Topofire')
+sport = read_csv("~/nrcs-scd-soil-moisture-eval-data/processed/SPoRT-LIS-corelations-generalized-depth.csv") |>
+  mutate(model = 'SPoRT-LIS') |>
+  #average results across horizontal positions in neon
+  group_by(network, site_id,  generalized_depth, model) |>
+  summarise(`Pearson's r` = median(`Pearson's r`, na.rm = T),
+            Bias = median(Bias, na.rm = T),
+            RMSE = median(RMSE, na.rm = T),
+            KGE = median(KGE, na.rm = T)) |>
+  ungroup()
 
-soilwat2 = read_csv("~/nrcs-scd-soil-moisture-eval-data/processed/soilwat2-corelations-generalized-depth.csv") %>%
-  mutate(model = 'SOILWAT2')
+soilwat2 = read_csv("~/nrcs-scd-soil-moisture-eval-data/processed/soilwat2-corelations-generalized-depth.csv") |>
+  mutate(model = 'SOILWAT2')|>
+  #average results across horizontal positions in neon
+  group_by(network, site_id,  generalized_depth, model) |>
+  summarise(`Pearson's r` = median(`Pearson's r`, na.rm = T),
+            Bias = median(Bias, na.rm = T),
+            RMSE = median(RMSE, na.rm = T),
+            KGE = median(KGE, na.rm = T)) |>
+  ungroup()
 
-all_results = bind_rows(topofire, soilwat2)
+all_results = bind_rows(sport, soilwat2)
 
 # plot rneonSoilFlux# plot results
 states = read_sf("~/mco-drought-indicators/processing/base-data/raw/states.shp") %>%
@@ -19,12 +33,13 @@ plot_data = all_results %>%
   left_join(., station_data) %>%
   drop_na(latitude, longitude) %>%
   st_as_sf(., coords = c('longitude', 'latitude'), crs = 4326) %>%
-  mutate(name_new = ifelse(generalized_depth == 'Deep', 'Deep (>50cm)', 
+  mutate(name_new = ifelse(generalized_depth == 'Deep', 'Deep (>40cm)', 
                            ifelse(generalized_depth == 'Shallow', 'Shallow (<= 10cm)', 
-                                  ifelse(generalized_depth == 'Middle', 'Middle (>10cm - <=50cm)', 'Depth Averaged'))),
+                                  ifelse(generalized_depth == 'Middle', 'Middle (>10cm - <=40cm)', 'Depth Averaged'))),
          name_new = factor(name_new, levels = c('Depth Averaged', 'Shallow', 
-                                                'Shallow (<= 10cm)', 'Middle (>10cm - <=50cm)', 
-                                                'Deep (>50cm)')))
+                                                'Shallow (<= 10cm)', 'Middle (>10cm - <=40cm)', 
+                                                'Deep (>40cm)')))
+
 
 make_plot = function(data, variable, states, 
                      model = NULL,
@@ -34,70 +49,99 @@ make_plot = function(data, variable, states,
                      width = 8,
                      depth_avg_only = FALSE) {
   
-  variable <- rlang::ensym(variable)  # Convert to symbol
+  variable <- rlang::ensym(variable)
   
-  # Optional filter by model name
-  if (!is.null(model)) {
-    data <- data %>% filter(model == !!model)
-  }
+  # Optional model filter
+  if (!is.null(model)) data <- dplyr::filter(data, model == !!model)
   
-  # Optional filter to include only "Depth Averaged"
-  if (depth_avg_only) {
-    data <- data %>% filter(name_new == "Depth Averaged")
-  }
+  # Optional depth filter
+  if (depth_avg_only) data <- dplyr::filter(data, name_new == "Depth Averaged")
   
-  # Apply clamping to avoid negative values
-  if (clamp) {
-    data <- data %>% mutate(!!variable := pmax(!!variable, 0))
-  }
+  # --- Normalize any legacy labels (safety) and set desired facet order ---
+  desired_levels <- c(
+    "Shallow (<= 10cm)",
+    "Middle (>10cm - <=40cm)",
+    "Deep (>40cm)",
+    "Depth Averaged"
+  )
   
-  # Reproject geometries to EPSG:5070
-  data <- sf::st_transform(data, 5070)
+  data <- data %>%
+    dplyr::mutate(
+      # If any plain labels got through, upgrade them to the new detailed ones
+      name_new = dplyr::case_when(
+        name_new == "Shallow" ~ "Shallow (<= 10cm)",
+        name_new == "Middle"  ~ "Middle (>10cm - <=40cm)",
+        name_new == "Deep"    ~ "Deep (>40cm)",
+        TRUE                  ~ as.character(name_new)
+      ),
+      # Reorder facets: Shallow, Middle, Deep, Depth Averaged
+      name_new = forcats::fct_relevel(name_new, desired_levels)
+    )
+  
+  # Apply clamping
+  if (clamp) data <- dplyr::mutate(data, !!variable := pmax(!!variable, 0))
+  
+  # Reproject to Albers Equal Area
+  data   <- sf::st_transform(data, 5070)
   states <- sf::st_transform(states, 5070)
   
-  # Dynamic title
-  plot_title <- if (!is.null(model)) paste(model, "Correlations") else "Model Correlations"
-  subtitle_text <- if (depth_avg_only) "Depth Averaged Only (without NEON stations)" else "(without NEON stations)"
+  # Legend title
+  var_label <- rlang::as_name(variable)
+  legend_title <- dplyr::case_when(
+    var_label == "KGE"         ~ "Kling-Gupta Efficiency (KGE)",
+    var_label == "NSE"         ~ "Nash-Sutcliffe Efficiency (NSE)",
+    var_label == "RMSE"        ~ "Root Mean Square Error (RMSE)",
+    var_label == "Bias"        ~ "Bias",
+    var_label == "Pearson's r" ~ "Pearson's r",
+    TRUE                       ~ var_label
+  )
   
-  # Create the plot
-  cor_plot <- ggplot(data, aes(fill = !!variable)) +
-    geom_sf(data = states, fill = 'transparent') +
-    geom_sf(shape = 21, color = 'black') +
-    scale_fill_gradientn(colours = viridis::turbo(5) %>% rev()) +
-    facet_wrap(~name_new) + 
-    theme_bw(base_size = 16) +
-    guides(fill = guide_colourbar(title.position = "bottom", title.hjust = 0.5)) +
-    theme(
-      legend.key = element_blank(),
-      strip.background = element_rect(colour = "transparent", fill = "transparent"),
-      legend.position = 'bottom', 
-      legend.key.width = unit(2, "cm"),
-      plot.title = element_text(hjust = 0.5, size = 18),
-      plot.subtitle = element_text(hjust = 0.5, size = 12)
-    ) +
-    ggtitle(plot_title, subtitle = subtitle_text)
+  plot_title   <- if (!is.null(model)) paste(model, legend_title) else paste("Model", legend_title)
+  subtitle_txt <- if (depth_avg_only) "Depth Averaged Only" else ""
   
-  # Save the plot if export path is given
-  if (!is.null(export_path)) {
-    ggsave(export_path, plot = cor_plot, height = height, width = width)
-    message("Plot saved to: ", export_path)
+  label_func <- function(x) {
+    formatted <- format(round(x, 2), nsmall = 2)
+    if (clamp && length(x) > 0) formatted[which.min(x)] <- paste0("<", formatted[which.min(x)])
+    formatted
   }
   
-  return(cor_plot)
+  cor_plot <- ggplot2::ggplot(data, ggplot2::aes(fill = !!variable)) +
+    ggplot2::geom_sf(data = states, fill = 'transparent') +
+    ggplot2::geom_sf(shape = 21, color = 'black') +
+    ggplot2::scale_fill_gradientn(
+      colours = rev(viridis::turbo(5)),
+      labels  = label_func
+    ) +
+    ggplot2::facet_wrap(~ name_new) +
+    ggplot2::theme_bw(base_size = 16) +
+    ggplot2::guides(fill = ggplot2::guide_colourbar(title = legend_title, title.position = "bottom", title.hjust = 0.5)) +
+    ggplot2::theme(
+      legend.key       = ggplot2::element_blank(),
+      legend.position  = 'bottom',
+      legend.key.width = grid::unit(2, "cm"),
+      strip.background = ggplot2::element_rect(colour = "transparent", fill = "transparent"),
+      plot.title       = ggplot2::element_text(hjust = 0.5, size = 18),
+      plot.subtitle    = ggplot2::element_text(hjust = 0.5, size = 12)
+    ) +
+    ggplot2::ggtitle(plot_title, subtitle = subtitle_txt)
+  
+  if (!is.null(export_path)) {
+    ggplot2::ggsave(export_path, plot = cor_plot, height = height, width = width)
+    message("Plot saved to: ", export_path)
+  }
+  cor_plot
 }
 
-# Create a plot for the Topofire model, clamped, only depth-averaged data
 make_plot(
   data = plot_data,
   variable = `Pearson's r`,
   states = states,
-  model = "Topofire",
+  model = "SPoRT-LIS",
   clamp = TRUE,
   depth_avg_only = FALSE,
-  export_path = '~/nrcs-scd-soil-moisture-eval/figs/topofire-pearson-r-clamped.png'
+  export_path = '~/nrcs-scd-soil-moisture-eval/figs/sport-pearson-r-clamped.png'
 )
 
-# Create a plot for the Topofire model, clamped, only depth-averaged data
 make_plot(
   data = plot_data,
   variable = `Pearson's r`,
@@ -108,19 +152,16 @@ make_plot(
   export_path = '~/nrcs-scd-soil-moisture-eval/figs/soilwat2-pearson-r-clamped.png'
 )
 
-# Create a plot for the Topofire model, clamped, only depth-averaged data
 make_plot(
   data = plot_data,
   variable = `Bias`,
   states = states,
-  model = "Topofire",
+  model = "SPoRT-LIS",
   clamp = F,
   depth_avg_only = FALSE,
-  export_path = '~/nrcs-scd-soil-moisture-eval/figs/topofire-bias.png'
+  export_path = '~/nrcs-scd-soil-moisture-eval/figs/sport-bias.png'
 )
 
-
-# Create a plot for the Topofire model, clamped, only depth-averaged data
 make_plot(
   data = plot_data,
   variable = `Bias`,
@@ -131,19 +172,16 @@ make_plot(
   export_path = '~/nrcs-scd-soil-moisture-eval/figs/soilwat2-bias.png'
 )
 
-# Create a plot for the Topofire model, clamped, only depth-averaged data
 make_plot(
   data = plot_data,
   variable = `KGE`,
   states = states,
-  model = "Topofire",
+  model = "SPoRT-LIS",
   clamp = T,
   depth_avg_only = FALSE,
-  export_path = '~/nrcs-scd-soil-moisture-eval/figs/topofire-kge.png'
+  export_path = '~/nrcs-scd-soil-moisture-eval/figs/sport-kge.png'
 )
 
-
-# Create a plot for the Topofire model, clamped, only depth-averaged data
 make_plot(
   data = plot_data,
   variable = `KGE`,
@@ -154,42 +192,16 @@ make_plot(
   export_path = '~/nrcs-scd-soil-moisture-eval/figs/soilwat2-kge.png'
 )
 
-# Create a plot for the Topofire model, clamped, only depth-averaged data
-make_plot(
-  data = plot_data,
-  variable = `NSE`,
-  states = states,
-  model = "Topofire",
-  clamp = T,
-  depth_avg_only = FALSE,
-  export_path = '~/nrcs-scd-soil-moisture-eval/figs/topofire-nse.png'
-)
-
-
-# Create a plot for the Topofire model, clamped, only depth-averaged data
-make_plot(
-  data = plot_data,
-  variable = `NSE`,
-  states = states,
-  model = "SOILWAT2",
-  clamp = T,
-  depth_avg_only = FALSE,
-  export_path = '~/nrcs-scd-soil-moisture-eval/figs/soilwat2-nse.png'
-)
-
-# Create a plot for the Topofire model, clamped, only depth-averaged data
 make_plot(
   data = plot_data,
   variable = `RMSE`,
   states = states,
-  model = "Topofire",
+  model = "SPoRT-LIS",
   clamp = T,
   depth_avg_only = FALSE,
-  export_path = '~/nrcs-scd-soil-moisture-eval/figs/topofire-rmse.png'
+  export_path = '~/nrcs-scd-soil-moisture-eval/figs/sport-rmse.png'
 )
 
-
-# Create a plot for the Topofire model, clamped, only depth-averaged data
 make_plot(
   data = plot_data,
   variable = `RMSE`,
@@ -226,11 +238,15 @@ model_diff_plot = function(data, variable, states,
   # Extract selected variable
   summarized <- data_filtered %>%
     st_drop_geometry() %>%
-    select(site_id, model, name_new, value = !!variable)
+    select(network, site_id, model, name_new, value = !!variable)
   
   # Pivot to wide and compute differences
-  data_diff <- summarized %>%
-    pivot_wider(names_from = model, values_from = value)
+  data_diff <- summarized |>
+    pivot_wider(
+      names_from = model,
+      values_from = value,
+      id_cols = c(network, site_id, name_new)
+    )
   
   if (tolower(var_label) == "bias") {
     data_diff <- data_diff %>%
@@ -250,6 +266,9 @@ model_diff_plot = function(data, variable, states,
   data_diff <- data_diff %>%
     filter(!is.na(difference))
   
+  t.test(data_diff$`SPoRT-LIS`, data_diff$SOILWAT2, paired = TRUE) 
+  wilcox.test(data_diff$`SPoRT-LIS`, data_diff$SOILWAT2, paired = TRUE)
+  
   # Reattach geometry and depth labels
   site_meta <- data_filtered %>%
     select(site_id, name_new, geometry) %>%
@@ -258,6 +277,25 @@ model_diff_plot = function(data, variable, states,
   data_diff <- data_diff %>%
     left_join(site_meta, by = c("site_id", "name_new")) %>%
     st_as_sf()
+  
+  desired_levels <- c(
+    "Shallow (<= 10cm)",
+    "Middle (>10cm - <=40cm)",
+    "Deep (>40cm)",
+    "Depth Averaged"
+  )
+  
+  data_diff <- data_diff %>%
+    dplyr::mutate(
+      name_new = as.character(name_new),
+      name_new = dplyr::case_when(
+        name_new == "Shallow" ~ "Shallow (<= 10cm)",
+        name_new == "Middle"  ~ "Middle (>10cm - <=40cm)",
+        name_new == "Deep"    ~ "Deep (>40cm)",
+        TRUE                  ~ name_new
+      ),
+      name_new = forcats::fct_relevel(name_new, desired_levels)
+    )
   
   # Reproject
   data_diff <- st_transform(data_diff, 5070)
@@ -298,7 +336,7 @@ model_diff_plot = function(data, variable, states,
   
   # Title logic
   plot_title <- paste(model_1, "vs", model_2, var_label, "Difference")
-  subtitle_text <- if (depth_avg_only) "Depth Averaged Only (without NEON stations)" else "(without NEON stations)"
+  subtitle_text <- if (depth_avg_only) "Depth Averaged Only" else ""
   
   # Plot
   diff_plot <- ggplot(data_diff, aes(fill = !!plot_var)) +
@@ -338,10 +376,10 @@ model_diff_plot(
   variable = 'KGE',
   states = states,
   model_1 = "SOILWAT2",
-  model_2 = "Topofire",
+  model_2 = "SPoRT-LIS",
   clamp_to_percentile = TRUE,
   depth_avg_only = F,
-  export_path = "~/nrcs-scd-soil-moisture-eval/figs/diff-topofire-vs-soilwat2-kge.png"
+  export_path = "~/nrcs-scd-soil-moisture-eval/figs/diff-sport-vs-soilwat2-kge.png"
 )
 
 model_diff_plot(
@@ -349,10 +387,10 @@ model_diff_plot(
   variable = "Pearson's r",
   states = states,
   model_1 = "SOILWAT2",
-  model_2 = "Topofire",
+  model_2 = "SPoRT-LIS",
   clamp_to_percentile = TRUE,
   depth_avg_only = F,
-  export_path = "~/nrcs-scd-soil-moisture-eval/figs/diff-topofire-vs-soilwat2-r.png"
+  export_path = "~/nrcs-scd-soil-moisture-eval/figs/diff-sport-vs-soilwat2-r.png"
 )
 
 model_diff_plot(
@@ -360,10 +398,10 @@ model_diff_plot(
   variable = 'Bias',
   states = states,
   model_1 = "SOILWAT2",
-  model_2 = "Topofire",
+  model_2 = "SPoRT-LIS",
   clamp_to_percentile = TRUE,
   depth_avg_only = F,
-  export_path = "~/nrcs-scd-soil-moisture-eval/figs/diff-topofire-vs-soilwat2-bias.png"
+  export_path = "~/nrcs-scd-soil-moisture-eval/figs/diff-sport-vs-soilwat2-bias.png"
 )
 
 model_diff_plot(
@@ -371,108 +409,8 @@ model_diff_plot(
   variable = 'RMSE',
   states = states,
   model_1 = "SOILWAT2",
-  model_2 = "Topofire",
+  model_2 = "SPoRT-LIS",
   clamp_to_percentile = TRUE,
   depth_avg_only = F,
-  export_path = "~/nrcs-scd-soil-moisture-eval/figs/diff-topofire-vs-soilwat2-RMSE.png"
-)
-
-model_diff_plot(
-  data = plot_data,
-  variable = 'NSE',
-  states = states,
-  model_1 = "SOILWAT2",
-  model_2 = "Topofire",
-  clamp_to_percentile = TRUE,
-  depth_avg_only = F,
-  export_path = "~/nrcs-scd-soil-moisture-eval/figs/diff-topofire-vs-soilwat2-RMSE.png"
-)
-
-
-# hitsogram plot
-
-histogram_plot = function(data, variable, network, 
-                          model = NULL,
-                          clamp = FALSE, 
-                          export_path = NULL, 
-                          height = 7, 
-                          width = 8,
-                          depth_avg_only = FALSE) {
-  
-  variable = rlang::ensym(variable)  # Convert variable to a symbol
-  network = rlang::ensym(network)    # Convert network column to a symbol
-  
-  # Optional filter by model
-  if (!is.null(model)) {
-    data <- data %>% filter(model == !!model)
-  }
-  
-  # Optional filter to include only "Depth Averaged"
-  if (depth_avg_only) {
-    data <- data %>% filter(name_new == "Depth Averaged")
-  }
-  
-  # Apply clamping
-  if (clamp) {
-    data <- data %>% mutate(!!variable := pmax(!!variable, 0))
-  }
-  
-  # Dynamic title
-  plot_title <- if (!is.null(model)) paste(model, "Correlations") else "Model Correlations"
-  subtitle_text <- if (depth_avg_only) "Depth Averaged Only (without NEON stations)" else "(without NEON stations)"
-  
-  # Generate the histogram
-  hist_plot = ggplot(data, aes(x = !!variable, color = !!network)) +
-  geom_density(alpha = 0.6) +
-    facet_wrap(~name_new) + 
-    theme_bw(base_size = 16) +
-    theme(
-      legend.key = element_blank(),
-      strip.background = element_rect(colour = "transparent", fill = "transparent"),
-      legend.position = 'bottom', 
-      legend.key.width = unit(1, "cm"),
-      plot.title = element_text(hjust = 0.5, size = 18),
-      plot.subtitle = element_text(hjust = 0.5, size = 12)
-    ) +
-    ggtitle(plot_title, subtitle = subtitle_text) +
-    labs(y = 'Station Density', fill = NULL, color = NULL)
-  
-  if (!is.null(export_path)) {
-    ggsave(export_path, plot = hist_plot, height = height, width = width)
-    message("Plot saved to: ", export_path)
-  }
-  
-  return(hist_plot)
-}
-
-histogram_plot(
-  plot_data, `Pearson's r`, network,
-  model = "Topofire",
-  clamp = TRUE,
-  depth_avg_only = F,
-  export_path = "~/nrcs-scd-soil-moisture-eval/figs/topofire-r-hist-clamped.png"
-)
-
-histogram_plot(
-  plot_data, `Pearson's r`, network,
-  model = "SOILWAT2",
-  clamp = TRUE,
-  depth_avg_only = F,
-  export_path = "~/nrcs-scd-soil-moisture-eval/figs/soilwat2-r-hist-clamped.png"
-)
-
-histogram_plot(
-  plot_data, `KGE`, network,
-  model = "Topofire",
-  clamp = TRUE,
-  depth_avg_only = F,
-  export_path = "~/nrcs-scd-soil-moisture-eval/figs/topofire-kge-hist-clamped.png"
-)
-
-histogram_plot(
-  plot_data, `KGE`, network,
-  model = "SOILWAT2",
-  clamp = TRUE,
-  depth_avg_only = F,
-  export_path = "~/nrcs-scd-soil-moisture-eval/figs/soilwat2-kge-hist-clamped.png"
+  export_path = "~/nrcs-scd-soil-moisture-eval/figs/diff-sport-vs-soilwat2-RMSE.png"
 )
